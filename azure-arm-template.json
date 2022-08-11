@@ -1,0 +1,686 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "Location": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "The Azure Location of the Kong Runtime Instances"
+            }
+        },
+
+        "Version": {
+            "type": "string",
+            "defaultValue": "2.8.1.2",
+            "metadata": {
+                "description": "The Cluster Control Plane from the Kong Cloud console"
+            }
+        },
+        "ClusterControlPlane": {
+            "type": "string",
+            "metadata": {
+                "description": "The Cluster Control Plane from the Kong Cloud console"
+            }
+        },
+        "ClusterTelemetryEndpoint": {
+            "type": "string",
+            "metadata": {
+                "description": "The Cluster Telemetry Endpoint from the Kong Cloud console"
+            }
+        },
+        "ClusterCertificate": {
+            "type": "string",
+            "metadata": {
+                "description": "The Cluster Telemetry Endpoint from the Kong Cloud console"
+            }
+        },
+        "ClusterCertificateKey": {
+            "type": "securestring",
+            "metadata": {
+                "description": "The Cluster Telemetry Endpoint from the Kong Cloud console"
+            }
+        },
+
+        "VMSize": {
+            "type": "string",
+            "defaultValue": "Standard_B1ms",
+            "metadata": {
+                "description": "Instance type for the Kong Runtime VMs"
+            }
+        },
+        "CreateRedisCluster": {
+            "type": "string",
+            "defaultValue": "No",
+            "allowedValues": [ "Yes", "No" ],
+            "metadata": {
+                "description": "Select \"Yes\" to create an Azure Cache for Redis Cluster, \"No\" to skip (default)."
+            }
+        },
+        "EnableLogCollection": {
+            "type": "string",
+            "defaultValue": "No",
+            "allowedValues": [ "Yes", "No" ],
+            "metadata": {
+                "description": "Select \"Yes\" to setup Log Analytics, \"No\" to skip (default)."
+            }
+        },
+
+        "VNetName": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Optional Existing VNet Name; Enter if you don't want to create a new VNet"
+            }
+        },
+        "SubnetName": {
+            "Type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Optional Existing Subnet Name; Enter if you don't want to create a new VNet"
+            }
+        }
+    },
+    "functions": [],
+    "variables": {
+        "kongId": "[first(split(parameters('ClusterControlPlane'), '.'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "GenerateKeypair",
+            "location": "[parameters('Location')]",
+            "kind": "AzureCLI",
+            "properties": {
+                "azCliVersion": "2.9.1",
+                "retentionInterval": "P1D",
+                "scriptContent": "#/bin/bash -e\necho -e 'y' | ssh-keygen -f sshkey -N ''\necho \"{\\\"private_key\\\":\\\"$(cat sshkey)\\\",\\\"public_key\\\":\\\"$(cat sshkey.pub)\\\"}\" > $AZ_SCRIPTS_OUTPUT_PATH",
+                "timeout": "PT30M"
+            }
+        },
+        {
+            "type": "Microsoft.Compute/sshPublicKeys",
+            "apiVersion": "2022-03-01",
+            "name": "KongPublicKey",
+            "location": "[parameters('Location')]",
+            "properties": {
+                "publicKey": "[reference('GenerateKeypair').outputs.public_key]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', 'GenerateKeypair')]"
+            ]
+        },
+
+        {
+            "apiVersion": "2021-10-01",
+            "name": "[concat('KongKeyVault', variables('kongId'))]",
+            "location": "[parameters('Location')]",
+            "type": "Microsoft.KeyVault/vaults",
+            "properties": {
+                "enabledForDeployment": true,
+                "enabledForTemplateDeployment": true,
+                "enabledForDiskEncryption": false,
+                "enableRbacAuthorization": true,
+                "accessPolicies": [],
+                "tenantId": "[subscription().tenantId]",
+                "sku": {
+                    "name": "Standard",
+                    "family": "A"
+                },
+                "publicNetworkAccess": "Enabled",
+                "enableSoftDelete": true,
+                "softDeleteRetentionInDays": 7,
+                "networkAcls": {
+                    "defaultAction": "Allow",
+                    "bypass": "AzureServices",
+                    "ipRules": [],
+                    "virtualNetworkRules": []
+                }
+            }
+        },
+        {
+            "type": "Microsoft.KeyVault/vaults/secrets",
+            "apiVersion": "2021-10-01",
+            "name": "[concat('KongKeyVault', variables('kongId'), '/ssh-private-key')]",
+            "properties": {
+                "value": "[reference('GenerateKeypair').outputs.private_key]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Resources/deploymentScripts', 'GenerateKeypair')]",
+                "[resourceId('Microsoft.KeyVault/vaults', concat('KongKeyVault', variables('kongId')))]"
+            ]
+        },
+        {
+            "type": "Microsoft.KeyVault/vaults/secrets",
+            "apiVersion": "2021-10-01",
+            "name": "[concat('KongKeyVault', variables('kongId'), '/cluster-certificate')]",
+            "properties": {
+                "value": "[parameters('ClusterCertificate')]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.KeyVault/vaults', concat('KongKeyVault', variables('kongId')))]"
+            ]
+        },
+        {
+            "type": "Microsoft.KeyVault/vaults/secrets",
+            "apiVersion": "2021-10-01",
+            "name": "[concat('KongKeyVault', variables('kongId'), '/cluster-certificate-key')]",
+            "properties": {
+                "value": "[parameters('ClusterCertificateKey')]"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.KeyVault/vaults', concat('KongKeyVault', variables('kongId')))]"
+            ]
+        },
+
+
+        {
+            "condition": "[equals(parameters('VNetName'), '')]",
+            "type": "Microsoft.Network/virtualNetworks",
+            "apiVersion": "2021-08-01",
+            "name": "KongVNet",
+            "location": "[parameters('Location')]",
+            "properties": {
+                "addressSpace": {
+                    "addressPrefixes": [
+                        "10.0.0.0/16"
+                    ]
+                },
+                "subnets": [
+                    {
+                        "name": "default",
+                        "properties": {
+                            "addressPrefix": "10.0.0.0/16"
+                        }
+                    }
+                ]
+            }
+        },
+
+        {
+            "type": "Microsoft.Network/networkSecurityGroups",
+            "apiVersion": "2021-08-01",
+            "name": "KongVMNSG",
+            "location": "[parameters('Location')]",
+            "properties": {
+                "securityRules": [
+                    {
+                        "name": "Public",
+                        "properties": {
+                            "access": "Allow",
+                            "destinationAddressPrefix": "*",
+                            "destinationPortRanges": [
+                                "8000",
+                                "8443",
+                                "22"
+                            ],
+                            "direction": "Inbound",
+                            "priority": 1000,
+                            "protocol": "Tcp",
+                            "sourceAddressPrefix": "*",
+                            "sourcePortRange": "*"
+                        }
+                    }
+                ]
+            }
+        },
+
+        {
+            "type": "Microsoft.Network/publicIPAddresses",
+            "apiVersion": "2021-08-01",
+            "name": "KongPublicIP",
+            "location": "[parameters('Location')]",
+            "sku": {
+                "name": "Standard"
+            },
+            "properties": {
+                "publicIPAllocationMethod": "Static"
+            }
+        },
+
+        {
+            "type": "Microsoft.Network/loadBalancers",
+            "apiVersion": "2021-08-01",
+            "name": "KongLB",
+            "location": "[parameters('Location')]",
+            "sku": {
+                "name": "Standard"
+            },
+            "properties": {
+                "backendAddressPools": [
+                    {
+                        "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/backendAddressPools/default')]",
+                        "name": "default"
+                    }
+                ],
+                "frontendIPConfigurations": [
+                    {
+                        "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/frontendIPConfigurations/default')]",
+                        "name": "default",
+                        "properties": {
+                            "publicIPAddress": {
+                                "id": "[resourceId('Microsoft.Network/publicIpAddresses', 'KongPublicIP')]"
+                            }
+                        }
+                    }
+                ],
+                "loadBalancingRules": [
+                    {
+                        "name": "http",
+                        "properties": {
+                            "backendAddressPool": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/backendAddressPools/default')]"
+                            },
+                            "backendPort": 8000,
+                            "enableFloatingIP": false,
+                            "frontendIPConfiguration": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/frontendIPConfigurations/default')]"
+                            },
+                            "frontendPort": 80,
+                            "idleTimeoutInMinutes": 5,
+                            "loadDistribution": "Default",
+                            "probe": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/probes/tcpProbeForHTTP')]"
+                            },
+                            "protocol": "Tcp"
+                        }
+                    },
+                    {
+                        "name": "https",
+                        "properties": {
+                            "backendAddressPool": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/backendAddressPools/default')]"
+                            },
+                            "backendPort": 8443,
+                            "enableFloatingIP": false,
+                            "frontendIPConfiguration": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/frontendIPConfigurations/default')]"
+                            },
+                            "frontendPort": 443,
+                            "idleTimeoutInMinutes": 5,
+                            "loadDistribution": "Default",
+                            "probe": {
+                                "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/probes/tcpProbeForHTTPS')]"
+                            },
+                            "protocol": "Tcp"
+                        }
+                    }
+                ],
+                "probes": [
+                    {
+                        "name": "tcpProbeForHTTP",
+                        "properties": {
+                            "intervalInSeconds": 30,
+                            "numberOfProbes": 2,
+                            "port": 8000,
+                            "protocol": "tcp"
+                        }
+                    },
+                    {
+                        "name": "tcpProbeForHTTPS",
+                        "properties": {
+                            "intervalInSeconds": 30,
+                            "numberOfProbes": 2,
+                            "port": 8443,
+                            "protocol": "tcp"
+                        }
+                    }
+                ]
+            },
+            "dependsOn": ["[resourceId('Microsoft.Network/publicIPAddresses', 'KongPublicIP')]"]
+        },
+
+        {
+            "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+            "name": "[concat('KongUserAssignedEntity', variables('kongId'))]",
+            "apiVersion": "2018-11-30",
+            "location": "[parameters('Location')]"
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2020-10-01-preview",
+            "name": "[guid(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('KongUserAssignedEntity', variables('kongId'))), resourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6'), resourceGroup().id)]",
+            "scope": "[concat('Microsoft.KeyVault/vaults/KongKeyVault', variables('kongId'))]",
+            "properties": {
+                "roleDefinitionId": "[resourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')]",
+                "principalId": "[reference(concat('KongUserAssignedEntity', variables('kongId'))).principalId]",
+                "principalType": "ServicePrincipal"
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('KongUserAssignedEntity', variables('kongId')))]",
+                "[resourceId('Microsoft.KeyVault/vaults', concat('KongKeyVault', variables('kongId')))]"
+            ]
+        },
+        {
+            "type": "Microsoft.Compute/virtualMachineScaleSets",
+            "apiVersion": "2022-03-01",
+            "name": "KongScaleSet",
+            "location": "[parameters('Location')]",
+            "sku": {
+                "capacity": 1,
+                "name": "[parameters('VMSize')]"
+            },
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('KongUserAssignedEntity', variables('kongId')))]": {}
+                }
+            },
+            "properties": {
+                "orchestrationMode": "Uniform",
+                "overprovision": false,
+                "platformFaultDomainCount": 1,
+                "scaleInPolicy": {
+                    "rules": [
+                        "Default"
+                    ]
+                },
+                "singlePlacementGroup": false,
+                "upgradePolicy": {
+                    "mode": "Manual"
+                },
+                "virtualMachineProfile": {
+                    "extensionProfile": {
+                        "extensions": [
+                            {
+                                "name": "AzureMonitorLinuxAgent",
+                                "properties": {
+                                    "publisher": "Microsoft.Azure.Monitor",
+                                    "type": "AzureMonitorLinuxAgent",
+                                    "typeHandlerVersion": "1.5",
+                                    "autoUpgradeMinorVersion": true,
+                                    "enableAutomaticUpgrade": true
+                                }
+                            }
+                        ]
+                    },
+                    "networkProfile": {
+                        "networkInterfaceConfigurations": [
+                            {
+                                "name": "[concat('KongNetIfaceConfiguration', variables('kongId'))]",
+                                "properties": {
+                                    "ipConfigurations": [
+                                        {
+                                            "name": "[concat('KongIPConfiguration', variables('kongId'))]",
+                                            "properties": {
+                                                "loadBalancerBackendAddressPools": [
+                                                    {
+                                                        "id": "[concat(resourceId('Microsoft.Network/loadBalancers', 'konglb'), '/backendAddressPools/default')]"
+                                                    }
+                                                ],
+                                                "primary": true,
+                                                "publicIPAddressConfiguration": {
+                                                    "name": "[concat('KongPublicIPConfiguration', variables('kongId'))]",
+                                                    "properties": {
+                                                        "dnsSettings": {
+                                                            "domainNameLabel": "[concat('kong-', variables('kongId'))]"
+                                                        },
+                                                        "idleTimeoutInMinutes": 15
+                                                    }
+                                                },
+                                                "subnet": {
+                                                    "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', if(equals(parameters('VNetName'), ''), 'KongVNet', parameters('VNetName')), if(equals(parameters('SubnetName'), ''), 'default', parameters('SubnetName')))]"
+                                                }
+                                            }
+                                        }
+                                    ],
+                                    "networkSecurityGroup": {
+                                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', 'KongVMNSG')]"
+                                    },
+                                    "primary": true
+                                }
+                            }
+                        ]
+                    },
+                    "osProfile": {
+                        "adminUsername": "ubuntu",
+                        "computerNamePrefix": "[toLower(substring(concat('kong', uniqueString(resourceGroup().id)), 0, 9))]",
+                        "customData": "[base64(concat('#!/bin/bash -xe\n','\n','export VERSION=',parameters('Version'),'\n','export CLUSTER_CONTROL_PLANE=',parameters('ClusterControlPlane'),'\n','export CLUSTER_SERVER_NAME=$(echo $CLUSTER_CONTROL_PLANE | cut -d: -f1)\n','export CLUSTER_TELEMETRY_ENDPOINT=',parameters('ClusterTelemetryEndpoint'),'\n','export CLUSTER_TELEMETRY_SERVER_NAME=$(echo $CLUSTER_TELEMETRY_ENDPOINT | cut -d: -f1)\n','\n','export KONG_CONFIG_PATH=/etc/kong/kong.conf\n','export CLUSTER_CERT_PATH=/etc/kong/cluster_cert.crt\n','export CLUSTER_CERT_KEY_PATH=/etc/kong/cluster_cert_key.key\n','\n','echo \"deb [trusted=yes] https://download.konghq.com/gateway-2.x-ubuntu-$(lsb_release -sc)/ default all\" | tee /etc/apt/sources.list.d/kong.list\n','apt update\n','apt install -y jq kong-enterprise-edition=${VERSION}\n','\n','export VAULT_ACCESS_TOKEN=$(curl -fSsL -H \"Metadata: true\" \"http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fvault.azure.net\" | jq -r .access_token)\n','\n','export CLUSTER_CERT=$(curl -fSsL -H \"Authorization: Bearer $VAULT_ACCESS_TOKEN\" \"https://kongkeyvault76c7ebee62.vault.azure.net/secrets/cluster-certificate?api-version=2016-10-01\" | jq -r .value)\n','export CLUSTER_CERT_KEY=$(curl -fSsL -H \"Authorization: Bearer $VAULT_ACCESS_TOKEN\" \"https://kongkeyvault76c7ebee62.vault.azure.net/secrets/cluster-certificate-key?api-version=2016-10-01\" | jq -r .value)\n','\n','echo $CLUSTER_CERT | base64 -d > $CLUSTER_CERT_PATH\n','echo $CLUSTER_CERT_KEY | base64 -d > $CLUSTER_CERT_KEY_PATH\n','\n','cat > $KONG_CONFIG_PATH <<EOF\n','role = data_plane\n','database = off\n','cluster_mtls = pki\n','cluster_control_plane = $CLUSTER_CONTROL_PLANE\n','cluster_server_name = $CLUSTER_SERVER_NAME\n','cluster_telemetry_endpoint = $CLUSTER_TELEMETRY_ENDPOINT\n','cluster_telemetry_server_name = $CLUSTER_TELEMETRY_SERVER_NAME\n','cluster_cert = $CLUSTER_CERT_PATH\n','cluster_cert_key = $CLUSTER_CERT_KEY_PATH\n','lua_ssl_trusted_certificate = system\n','EOF\n','\n','/usr/local/bin/kong start\n'))]",
+                        "linuxConfiguration": {
+                            "disablePasswordAuthentication": true,
+                            "ssh": {
+                                "publicKeys": [
+                                    {
+                                        "keyData": "[reference('KongPublicKey').publicKey]",
+                                        "path": "/home/ubuntu/.ssh/authorized_keys"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "storageProfile": {
+                        "imageReference": {
+                            "publisher": "canonical",
+                            "offer": "0001-com-ubuntu-server-focal",
+                            "sku": "20_04-lts-gen2",
+                            "version": "latest"
+                        },
+                        "osDisk": {
+                            "createOption": "fromImage",
+                            "caching": "ReadWrite",
+                            "managedDisk": {
+                                "storageAccountType": "StandardSSD_LRS"
+                            }
+                        }
+                    }
+                }
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/loadBalancers', 'KongLB')]",
+                "[resourceId('Microsoft.Network/virtualNetworks', 'KongVNet')]",
+                "[resourceId('Microsoft.Network/networkSecurityGroups', 'KongVMNSG')]",
+                "[resourceId('Microsoft.KeyVault/vaults/secrets', concat('KongKeyVault', variables('kongId')), 'cluster-certificate')]",
+                "[resourceId('Microsoft.KeyVault/vaults/secrets', concat('KongKeyVault', variables('kongId')), 'cluster-certificate-key')]",
+                "[resourceId('Microsoft.Compute/sshPublicKeys', 'KongPublicKey')]",
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('KongUserAssignedEntity', variables('kongId')))]"
+            ]
+        },
+        {
+            "type": "Microsoft.Insights/autoscaleSettings",
+            "apiVersion": "2015-04-01",
+            "name": "KongScaleSetAutoScale",
+            "location": "[parameters('Location')]",
+            "properties": {
+                "targetResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', 'KongScaleSet')]",
+                "profiles": [
+                    {
+                        "name": "DefaultProfile",
+                        "capacity": {
+                            "minimum": "1",
+                            "maximum": "16",
+                            "default": "1"
+                        },
+                        "rules": [
+                            {
+                                "metricTrigger": {
+                                    "metricName": "Percentage CPU",
+                                    "metricNamespace": "",
+                                    "metricResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', 'KongScaleSet')]",
+                                    "timeGrain": "PT1M",
+                                    "statistic": "Average",
+                                    "timeWindow": "PT10M",
+                                    "timeAggregation": "Average",
+                                    "operator": "GreaterThan",
+                                    "threshold": 75
+                                },
+                                "scaleAction": {
+                                    "direction": "Increase",
+                                    "type": "ChangeCount",
+                                    "value": "1",
+                                    "cooldown": "PT1M"
+                                }
+                            },
+                            {
+                                "metricTrigger": {
+                                    "metricName": "Percentage CPU",
+                                    "metricNamespace": "",
+                                    "metricResourceUri": "[resourceId('Microsoft.Compute/virtualMachineScaleSets', 'KongScaleSet')]",
+                                    "timeGrain": "PT1M",
+                                    "statistic": "Average",
+                                    "timeWindow": "PT10M",
+                                    "timeAggregation": "Average",
+                                    "operator": "LessThan",
+                                    "threshold": 25
+                                },
+                                "scaleAction": {
+                                    "direction": "Decrease",
+                                    "type": "ChangeCount",
+                                    "value": "1",
+                                    "cooldown": "PT1M"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            "dependsOn": ["[resourceId('Microsoft.Compute/virtualMachineScaleSets', 'KongScaleSet')]"]
+        },
+
+        {
+            "condition": "[equals(parameters('CreateRedisCluster'), 'Yes')]",
+            "type": "Microsoft.Cache/redis",
+            "apiVersion": "2021-06-01",
+            "name": "[concat('kong-redis-', variables('kongId'))]",
+            "location": "southindia",
+            "properties": {
+                "sku": {
+                    "name": "Basic",
+                    "family": "C",
+                    "capacity": 0
+                },
+                "redisConfiguration": {},
+                "enableNonSslPort": false,
+                "redisVersion": "6"
+            }
+        },
+
+        {
+            "condition": "[equals(parameters('EnableLogCollection'), 'Yes')]",
+            "type": "Microsoft.OperationalInsights/workspaces",
+            "apiVersion": "2021-12-01-preview",
+            "name": "KongLogAnalyticsWorkspace",
+            "location": "[parameters('Location')]",
+            "properties": {
+                "sku": {
+                    "name": "pergb2018"
+                }
+            }
+        },
+        {
+            "condition": "[equals(parameters('EnableLogCollection'), 'Yes')]",
+            "type": "Microsoft.OperationalInsights/workspaces/tables",
+            "apiVersion": "2021-12-01-preview",
+            "name": "KongLogAnalyticsWorkspace/KongLogsTable_CL",
+            "properties": {
+                "schema": {
+                    "columns": [
+                        {
+                            "name": "TimeGenerated",
+                            "type": "dateTime"
+                        },
+                        {
+                            "name": "RawData",
+                            "type": "string"
+                        }
+                    ],
+                    "name": "KongLogsTable_CL"
+                }
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', 'KongLogAnalyticsWorkspace')]"
+            ]
+        },
+        {
+            "condition": "[equals(parameters('EnableLogCollection'), 'Yes')]",
+            "type": "Microsoft.Insights/dataCollectionEndpoints",
+            "name": "KongDataCollectionEndpoint",
+            "location": "[parameters('Location')]",
+            "apiVersion": "2021-09-01-preview",
+            "properties": {
+                "networkAcls": {
+                    "publicNetworkAccess": "Enabled"
+                }
+            }
+        },
+        {
+            "condition": "[equals(parameters('EnableLogCollection'), 'Yes')]",
+            "type": "Microsoft.Insights/dataCollectionRules",
+            "name": "KongDataCollectionRule",
+            "location": "[parameters('Location')]",
+            "apiVersion": "2021-09-01-preview",
+            "properties": {
+                "dataCollectionEndpointId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', 'KongDataCollectionEndpoint')]",
+                "streamDeclarations": {
+                    "Custom-AccessLog": {
+                        "columns": [
+                            {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                            },
+                            {
+                                "name": "RawData",
+                                "type": "string"
+                            }
+                        ]
+                    }
+                },
+                "dataSources": {
+                    "logFiles": [
+                        {
+                            "streams": [
+                                "Custom-AccessLog"
+                            ],
+                            "filePatterns": [
+                                "/usr/local/kong/logs/access.log"
+                            ],
+                            "format": "text",
+                            "settings": {
+                                "text": {
+                                    "recordStartTimestampFormat": "dd/MMM/yyyy:HH:mm:ss zzz"
+                                }
+                            },
+                            "name": "AccessLog"
+                        }
+                    ]
+                },
+                "destinations": {
+                    "logAnalytics": [
+                        {
+                            "workspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', 'KongLogAnalyticsWorkspace')]",
+                            "name": "KongLogAnalyticsWorkspace"
+                        }
+                    ]
+                },
+                "dataFlows": [
+                    {
+                        "streams": [
+                            "Custom-AccessLog"
+                        ],
+                        "destinations": [
+                            "KongLogAnalyticsWorkspace"
+                        ],
+                        "transformKql": "source",
+                        "outputStream": "Custom-KongLogsTable_CL"
+                    }
+                ]
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', 'KongLogAnalyticsWorkspace')]",
+                "[resourceId('Microsoft.OperationalInsights/workspaces/tables', 'KongLogAnalyticsWorkspace', 'KongLogsTable_CL')]",
+                "[resourceId('Microsoft.Insights/dataCollectionEndpoints', 'KongDataCollectionEndpoint')]"
+            ]
+        }
+    ],
+    "outputs": {
+        "LoadBalancerIP": {
+            "type": "string",
+            "value": "[reference('KongPublicIP').IpAddress]"
+        },
+        "AzureCacheRedisDNS": {
+            "condition": "[equals(parameters('CreateRedisCluster'), 'Yes')]",
+            "type": "string",
+            "value": "[concat('kong-redis-', variables('kongId'), '.redis.cache.windows.net')]"
+        }
+    }
+}
