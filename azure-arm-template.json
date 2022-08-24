@@ -74,7 +74,7 @@
             }
         },
         "SubnetName": {
-            "Type": "string",
+            "type": "string",
             "defaultValue": "",
             "metadata": {
                 "description": "Optional Existing Subnet Name; Enter if you don't want to create a new VNet"
