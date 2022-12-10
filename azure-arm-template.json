@@ -12,7 +12,7 @@
 
         "Version": {
             "type": "string",
-            "defaultValue": "3.1.0.0",
+            "defaultValue": "3.1.1.0",
             "metadata": {
                 "description": "The Cluster Control Plane from the Kong Cloud console"
             }
